@@ -13,6 +13,7 @@ import os
 
 from aiohttp import web, ClientSession, ClientWebSocketResponse, WSMsgType
 from dotenv import load_dotenv
+from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
 
@@ -69,7 +70,30 @@ def open_deepgram_ws(request: web.Request) -> ClientWebSocketResponse:
     return dg_connection
 
 
-async def get_chatgpt_response(prompt: str, request: web.Request) -> str:
+async def call_chatgpt(message: str, request: web.Request) -> str:
+    app_client = request.app['app_client']
+    url = 'https://api.openai.com/v1/chat/completions'
+    key = os.getenv('OPENAI_API_KEY')
+    headers = {
+        'Authorization': f"Bearer {key}",
+    }
+    messages = [
+        {'role': 'user', 'content': message},
+    ]
+    payload = {
+        'model': 'gpt-3.5-turbo',
+        'messages': messages,
+    }
+    async with app_client.post(url, headers=headers, json=payload) as resp:
+        if resp.status != 200:
+            return ''
+        resp_payload = await resp.json()
+        response = resp_payload['choices'][0]['message']['content'].strip()
+
+    return response
+
+
+async def get_chatgpt_response(call_sid: str, prompt: str, request: web.Request) -> str:
     """Get a response from ChatGPT using Deepgram transcript as prompt.
 
     Parameters
@@ -83,24 +107,9 @@ async def get_chatgpt_response(prompt: str, request: web.Request) -> str:
     -------
     Text of ChatGPT response.
     """
-    app_client = request.app['app_client']
-    url = 'https://api.openai.com/v1/chat/completions'
-    key = os.getenv('OPENAI_API_KEY')
-    headers = {
-        'Authorization': f"Bearer {key}",
-    }
-    messages = [
-        {'role': 'user', 'content': prompt},
-    ]
-    payload = {
-        'model': 'gpt-3.5-turbo',
-        'messages': messages,
-    }
-    async with app_client.post(url, headers=headers, json=payload) as resp:
-        if resp.status != 200:
-            return ''
-        resp_payload = await resp.json()
-        response = resp_payload['choices'][0]['message']['content'].strip()
+    response = await call_chatgpt(prompt, request)
+
+    request.app['convos'][call_sid] += f'\n\nYou: {prompt}\n\nAssistant: {response}'
 
     return response
 
@@ -147,16 +156,26 @@ async def handle_deepgram_messages(
                     # to indicate the end of a transcript stream
                     response = END_TRANSCRIPT_MARKER
                     response_queue.put_nowait(response)
+                    await send_summary(call_sid, request)
                 else:
                     transcript = dg_msg['channel']['alternatives'][0]['transcript']
                     if transcript:
-                        response = await get_chatgpt_response(transcript, request)
+                        response = await get_chatgpt_response(call_sid, transcript, request)
                         response_queue.put_nowait(response)
             case WSMsgType.CLOSE:
                 response_queue.put_nowait(END_TRANSCRIPT_MARKER)
             case _:
                 logging.warning("Got unsupported message type from Deepgram!")
                 continue
+
+
+async def send_summary(call_sid: str, request: web.Request):
+    convo = request.app['convos'][call_sid]
+    message = f'Please summarize the following conversation between You and an assistant:\n\n{convo}'
+    summary = await call_chatgpt(message, request)
+    sms_data = request.app['sms_data'][call_sid]
+    twilio_client = request.app['twilio_client']
+    twilio_client.messages.create(to=sms_data['to'], from_=sms_data['from'], body=summary)
 
 
 async def handle_twilio_messages(
@@ -273,6 +292,13 @@ async def start(request: web.Request) -> web.Response:
         twilio_response.start().stream(url=stream_url, track='inbound_track')
         twilio_response.say('Welcome to Chat D G. What would you like to know?')
         await continue_call(request, twilio_response)
+
+        sms_data = {
+            'from': body['Called'],
+            'to': body['Caller'],
+        }
+        request.app['sms_data'][call_sid] = sms_data
+        request.app['convos'][call_sid] = ''
     else:
         logging.error('Expected payload from Twilio with a CallSid value!')
         twilio_response.say('Something went wrong! Please try again later.')
@@ -290,6 +316,14 @@ async def app_factory() -> web.Application:
     # Create an aiohttp.ClientSession for our application
     app_client = ClientSession()
     app['app_client'] = app_client
+
+    # Create a Twilio REST client for sending SMS
+    twilio_account_sid = os.environ['TWILIO_ACCOUNT_SID']
+    twilio_auth_token = os.environ['TWILIO_AUTH_TOKEN']
+    twilio_client = Client(twilio_account_sid, twilio_auth_token)
+    app['twilio_client'] = twilio_client
+    app['sms_data'] = {}
+    app['convos'] = {}
 
     # Create a place for deepgram_receivers to talk to REST handlers
     response_queues = {}
